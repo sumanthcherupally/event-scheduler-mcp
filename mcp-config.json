@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "gmail-calendar-maps": {
+      "command": "python",
+      "args": ["server.py"],
+      "env": {
+        "GOOGLE_MAPS_API_KEY": "YOUR_GOOGLE_MAPS_API_KEY"
+      }
+    }
+  }
+} 
