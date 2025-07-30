@@ -293,10 +293,11 @@ class GmailCalendarMapsServer:
 # Create server instance
 server = GmailCalendarMapsServer()
 
-# Create FastMCP server
+# Create FastMCP server with proper configuration
 mcp_server = FastMCP(
     name="gmail-calendar-maps-server",
-    instructions="A server that provides tools for Gmail, Google Calendar, and Google Maps integration."
+    version="1.0.0",
+    instructions="A server that provides tools for Gmail, Google Calendar, and Google Maps integration. You can use these tools to manage emails, calendar events, and get location information."
 )
 
 @mcp_server.tool()
@@ -452,6 +453,9 @@ async def find_nearby_places(location: str, radius: int = 5000, place_type: str 
         return f"Error: {str(e)}"
 
 def main():
+    """Main function to start the MCP server"""
+    logger.info("Starting Gmail Calendar Maps MCP Server...")
+    
     # Initialize Google APIs
     credentials_path = "credentials.json"
     api_key = os.getenv("GOOGLE_MAPS_API_KEY", "YOUR_GOOGLE_MAPS_API_KEY")
@@ -464,8 +468,12 @@ def main():
         success = asyncio.run(init_apis())
         if not success:
             logger.warning("Failed to initialize Google APIs. Some features may not work.")
+        else:
+            logger.info("Google APIs initialized successfully")
     except Exception as e:
         logger.warning(f"Failed to initialize Google APIs: {e}. Some features may not work.")
+    
+    logger.info("Starting MCP server with stdio transport...")
     
     # Start the MCP server
     mcp_server.run()
