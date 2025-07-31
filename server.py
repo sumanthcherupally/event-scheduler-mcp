@@ -6,24 +6,13 @@ MCP Server for Gmail, Calendar, and Maps Integration
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 
-import mcp.server
-import mcp.server.stdio
+from mcp.server import FastMCP
 from mcp.server.models import InitializationOptions
-from mcp.types import (
-    CallToolRequest,
-    CallToolResult,
-    ListToolsRequest,
-    ListToolsResult,
-    Tool,
-    TextContent,
-    ImageContent,
-    EmbeddedResource,
-    LoggingLevel,
-)
 
 # Google API imports
 from google.auth.transport.requests import Request
@@ -57,9 +46,26 @@ class GmailCalendarMapsServer:
         try:
             # Load credentials
             if Path(credentials_path).exists():
-                self.credentials = Credentials.from_authorized_user_file(
-                    credentials_path, SCOPES
-                )
+                # Check if this is a client secrets file or user credentials file
+                with open(credentials_path, 'r') as f:
+                    cred_data = json.load(f)
+                
+                if 'installed' in cred_data:
+                    # This is a client secrets file, we need to authenticate
+                    logger.info("Found client secrets file, starting OAuth flow...")
+                    flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
+                    self.credentials = flow.run_local_server(port=0)
+                    
+                    # Save the credentials for next time
+                    token_path = "token.json"
+                    with open(token_path, 'w') as token:
+                        token.write(self.credentials.to_json())
+                    logger.info(f"Credentials saved to {token_path}")
+                else:
+                    # This is a user credentials file
+                    self.credentials = Credentials.from_authorized_user_file(
+                        credentials_path, SCOPES
+                    )
                 
                 # Refresh if expired
                 if self.credentials and self.credentials.expired and self.credentials.refresh_token:
@@ -98,48 +104,54 @@ class GmailCalendarMapsServer:
                 headers = message['payload']['headers']
                 subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
                 sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown')
-                date = next((h['value'] for h in headers if h['name'] == 'Date'), '')
+                date = next((h['value'] for h in headers if h['name'] == 'Date'), 'Unknown')
+                snippet = message.get('snippet', '')
                 
                 messages.append({
                     'id': msg['id'],
                     'subject': subject,
                     'sender': sender,
                     'date': date,
-                    'snippet': message.get('snippet', '')
+                    'snippet': snippet
                 })
                 
             return messages
-        except HttpError as error:
+        except Exception as error:
             logger.error(f"Gmail API error: {error}")
             return {"error": str(error)}
 
     async def send_gmail_message(self, to: str, subject: str, body: str) -> Dict:
-        """Send Gmail message"""
+        """Send a Gmail message"""
         try:
             if not self.gmail_service:
                 return {"error": "Gmail service not initialized"}
                 
-            import base64
-            from email.mime.text import MIMEText
-            
-            message = MIMEText(body)
-            message['to'] = to
-            message['subject'] = subject
-            
-            raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
+            message = {
+                'raw': self._create_message(to, subject, body)
+            }
             
             sent_message = self.gmail_service.users().messages().send(
-                userId='me', body={'raw': raw_message}
+                userId='me', body=message
             ).execute()
             
             return {
-                'success': True,
                 'message_id': sent_message['id'],
                 'thread_id': sent_message['threadId']
             }
-        except HttpError as error:
+        except Exception as error:
             logger.error(f"Gmail send error: {error}")
             return {"error": str(error)}
+    
+    def _create_message(self, to: str, subject: str, body: str) -> str:
+        """Create a base64 encoded email message"""
+        import base64
+        from email.mime.text import MIMEText
+        
+        message = MIMEText(body)
+        message['to'] = to
+        message['subject'] = subject
+        
+        return base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
 
     async def list_calendar_events(self, calendar_id: str = 'primary', max_results: int = 10) -> List[Dict]:
         """List calendar events"""
@@ -164,21 +176,20 @@ class GmailCalendarMapsServer:
                 events.append({
                     'id': event['id'],
                     'summary': event.get('summary', 'No Title'),
-                    'description': event.get('description', ''),
                     'start': start,
                     'end': end,
                     'location': event.get('location', ''),
-                    'attendees': [a.get('email') for a in event.get('attendees', [])]
+                    'description': event.get('description', '')
                 })
                 
             return events
-        except HttpError as error:
+        except Exception as error:
             logger.error(f"Calendar API error: {error}")
             return {"error": str(error)}
 
     async def create_calendar_event(self, summary: str, start_time: str, end_time: str, 
                                   description: str = "", location: str = "", attendees: List[str] = None) -> Dict:
-        """Create calendar event"""
+        """Create a calendar event"""
         try:
             if not self.calendar_service:
                 return {"error": "Calendar service not initialized"}
@@ -186,6 +197,7 @@ class GmailCalendarMapsServer:
             event = {
                 'summary': summary,
                 'description': description,
+                'location': location,
                 'start': {
                     'dateTime': start_time,
                     'timeZone': 'UTC',
@@ -196,59 +208,50 @@ class GmailCalendarMapsServer:
                 },
             }
             
-            if location:
-                event['location'] = location
-                
             if attendees:
                 event['attendees'] = [{'email': email} for email in attendees]
-                
+            
             event = self.calendar_service.events().insert(
                 calendarId='primary', body=event
             ).execute()
             
             return {
-                'success': True,
                 'event_id': event['id'],
-                'html_link': event['htmlLink']
+                'summary': event['summary'],
+                'start': event['start']['dateTime'],
+                'end': event['end']['dateTime']
             }
-        except HttpError as error:
-            logger.error(f"Calendar create error: {error}")
+        except Exception as error:
+            logger.error(f"Calendar create event error: {error}")
             return {"error": str(error)}
 
     async def get_directions(self, origin: str, destination: str, mode: str = 'driving') -> Dict:
-        """Get directions using Google Maps"""
+        """Get directions between two locations"""
         try:
             if not self.gmaps_client:
                 return {"error": "Maps service not initialized"}
                 
-            directions = self.gmaps_client.directions(origin, destination, mode=mode)
+            directions_result = self.gmaps_client.directions(origin, destination, mode=mode)
             
-            if not directions:
+            if not directions_result:
                 return {"error": "No directions found"}
                 
-            route = directions[0]
-            legs = route['legs'][0]
+            route = directions_result[0]
+            leg = route['legs'][0]
             
             return {
-                'distance': legs['distance']['text'],
-                'duration': legs['duration']['text'],
-                'steps': [
-                    {
-                        'instruction': step['html_instructions'],
-                        'distance': step['distance']['text'],
-                        'duration': step['duration']['text']
-                    }
-                    for step in legs['steps']
-                ],
-                'start_address': legs['start_address'],
-                'end_address': legs['end_address']
+                'origin': leg['start_address'],
+                'destination': leg['end_address'],
+                'distance': leg['distance']['text'],
+                'duration': leg['duration']['text'],
+                'steps': [step['html_instructions'] for step in leg['steps']]
             }
         except Exception as error:
-            logger.error(f"Maps API error: {error}")
+            logger.error(f"Directions API error: {error}")
             return {"error": str(error)}
 
     async def geocode_address(self, address: str) -> Dict:
-        """Geocode an address"""
+        """Geocode an address to get coordinates"""
         try:
             if not self.gmaps_client:
                 return {"error": "Maps service not initialized"}
@@ -261,16 +264,17 @@ class GmailCalendarMapsServer:
             location = geocode_result[0]['geometry']['location']
             
             return {
-                'address': geocode_result[0]['formatted_address'],
+                'address': address,
                 'latitude': location['lat'],
-                'longitude': location['lng']
+                'longitude': location['lng'],
+                'formatted_address': geocode_result[0]['formatted_address']
             }
         except Exception as error:
-            logger.error(f"Geocoding error: {error}")
+            logger.error(f"Geocoding API error: {error}")
             return {"error": str(error)}
 
     async def find_nearby_places(self, location: str, radius: int = 5000, place_type: str = None) -> List[Dict]:
-        """Find nearby places"""
+        """Find nearby places around a location"""
         try:
             if not self.gmaps_client:
                 return {"error": "Maps service not initialized"}
@@ -282,7 +286,7 @@ class GmailCalendarMapsServer:
                 
             lat_lng = geocode_result[0]['geometry']['location']
             
-            # Find nearby places
+            # Search for nearby places
             places_result = self.gmaps_client.places_nearby(
                 location=lat_lng,
                 radius=radius,
@@ -295,8 +299,7 @@ class GmailCalendarMapsServer:
                     'name': place['name'],
                     'address': place.get('vicinity', ''),
                     'rating': place.get('rating', 'N/A'),
-                    'types': place.get('types', []),
-                    'place_id': place['place_id']
+                    'types': place.get('types', [])
                 })
                 
             return places
@@ -307,22 +310,21 @@ class GmailCalendarMapsServer:
 # Create server instance
 server = GmailCalendarMapsServer()
 
-@mcp.server.tool()
-async def list_gmail_messages_tool(
-    request: CallToolRequest,
-) -> CallToolResult:
+# Create FastMCP server with proper configuration
+mcp_server = FastMCP(
+    name="gmail-calendar-maps-server",
+    version="1.0.0",
+    instructions="A server that provides tools for Gmail, Google Calendar, and Google Maps integration. You can use these tools to manage emails, calendar events, and get location information."
+)
+
+@mcp_server.tool()
+async def list_gmail_messages(query: str = "", max_results: int = 10) -> str:
     """List recent Gmail messages with optional search query"""
     try:
-        args = request.arguments
-        query = args.get("query", "")
-        max_results = args.get("max_results", 10)
-        
         messages = await server.list_gmail_messages(query, max_results)
         
         if isinstance(messages, dict) and "error" in messages:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Error: {messages['error']}")]
-            )
+            return f"Error: {messages['error']}"
         
         result_text = "Recent Gmail Messages:\n\n"
         for msg in messages:
@@ -332,61 +334,34 @@ async def list_gmail_messages_tool(
             result_text += f"Snippet: {msg['snippet']}\n"
             result_text += "-" * 50 + "\n"
         
-        return CallToolResult(
-            content=[TextContent(type="text", text=result_text)]
-        )
+        return result_text
     except Exception as e:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Error: {str(e)}")]
-        )
+        return f"Error: {str(e)}"
 
-@mcp.server.tool()
-async def send_gmail_message_tool(
-    request: CallToolRequest,
-) -> CallToolResult:
+@mcp_server.tool()
+async def send_gmail_message(to: str, subject: str, body: str) -> str:
     """Send a Gmail message"""
     try:
-        args = request.arguments
-        to = args.get("to")
-        subject = args.get("subject")
-        body = args.get("body")
-        
         if not all([to, subject, body]):
-            return CallToolResult(
-                content=[TextContent(type="text", text="Error: to, subject, and body are required")]
-            )
+            return "Error: to, subject, and body are required"
         
         result = await server.send_gmail_message(to, subject, body)
         
         if "error" in result:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Error: {result['error']}")]
-            )
+            return f"Error: {result['error']}"
         
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Message sent successfully! Message ID: {result['message_id']}")]
-        )
+        return f"Message sent successfully! Message ID: {result['message_id']}"
     except Exception as e:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Error: {str(e)}")]
-        )
+        return f"Error: {str(e)}"
 
-@mcp.server.tool()
-async def list_calendar_events_tool(
-    request: CallToolRequest,
-) -> CallToolResult:
+@mcp_server.tool()
+async def list_calendar_events(calendar_id: str = "primary", max_results: int = 10) -> str:
     """List upcoming calendar events"""
     try:
-        args = request.arguments
-        calendar_id = args.get("calendar_id", "primary")
-        max_results = args.get("max_results", 10)
-        
         events = await server.list_calendar_events(calendar_id, max_results)
         
         if isinstance(events, dict) and "error" in events:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Error: {events['error']}")]
-            )
+            return f"Error: {events['error']}"
         
         result_text = "Upcoming Calendar Events:\n\n"
         for event in events:
@@ -397,146 +372,90 @@ async def list_calendar_events_tool(
                 result_text += f"Location: {event['location']}\n"
             if event['description']:
                 result_text += f"Description: {event['description']}\n"
-            result_text += "-" * 50 + "\n"
+            result_text += "-" * 30 + "\n"
         
-        return CallToolResult(
-            content=[TextContent(type="text", text=result_text)]
-        )
+        return result_text
     except Exception as e:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Error: {str(e)}")]
-        )
+        return f"Error: {str(e)}"
 
-@mcp.server.tool()
-async def create_calendar_event_tool(
-    request: CallToolRequest,
-) -> CallToolResult:
-    """Create a new calendar event"""
+@mcp_server.tool()
+async def create_calendar_event(summary: str, start_time: str, end_time: str, 
+                              description: str = "", location: str = "", attendees: str = "") -> str:
+    """Create a calendar event"""
     try:
-        args = request.arguments
-        summary = args.get("summary")
-        start_time = args.get("start_time")
-        end_time = args.get("end_time")
-        description = args.get("description", "")
-        location = args.get("location", "")
-        attendees = args.get("attendees", [])
-        
         if not all([summary, start_time, end_time]):
-            return CallToolResult(
-                content=[TextContent(type="text", text="Error: summary, start_time, and end_time are required")]
-            )
+            return "Error: summary, start_time, and end_time are required"
+        
+        attendee_list = [email.strip() for email in attendees.split(',')] if attendees else None
         
         result = await server.create_calendar_event(
-            summary, start_time, end_time, description, location, attendees
+            summary, start_time, end_time, description, location, attendee_list
         )
         
         if "error" in result:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Error: {result['error']}")]
-            )
+            return f"Error: {result['error']}"
         
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Event created successfully! Event ID: {result['event_id']}")]
-        )
+        return f"Event created successfully! Event ID: {result['event_id']}"
     except Exception as e:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Error: {str(e)}")]
-        )
+        return f"Error: {str(e)}"
 
-@mcp.server.tool()
-async def get_directions_tool(
-    request: CallToolRequest,
-) -> CallToolResult:
+@mcp_server.tool()
+async def get_directions(origin: str, destination: str, mode: str = "driving") -> str:
     """Get directions between two locations"""
     try:
-        args = request.arguments
-        origin = args.get("origin")
-        destination = args.get("destination")
-        mode = args.get("mode", "driving")
-        
         if not all([origin, destination]):
-            return CallToolResult(
-                content=[TextContent(type="text", text="Error: origin and destination are required")]
-            )
+            return "Error: origin and destination are required"
         
         result = await server.get_directions(origin, destination, mode)
         
         if "error" in result:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Error: {result['error']}")]
-            )
+            return f"Error: {result['error']}"
         
-        result_text = f"Directions from {result['start_address']} to {result['end_address']}:\n"
+        result_text = f"Directions from {result['origin']} to {result['destination']}:\n"
         result_text += f"Distance: {result['distance']}\n"
-        result_text += f"Duration: {result['duration']}\n\n"
+        result_text += f"Duration: {result['duration']}\n"
+        result_text += f"Mode: {mode}\n\n"
         result_text += "Steps:\n"
-        
         for i, step in enumerate(result['steps'], 1):
-            result_text += f"{i}. {step['instruction']} ({step['distance']}, {step['duration']})\n"
+            result_text += f"{i}. {step}\n"
         
-        return CallToolResult(
-            content=[TextContent(type="text", text=result_text)]
-        )
+        return result_text
     except Exception as e:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Error: {str(e)}")]
-        )
+        return f"Error: {str(e)}"
 
-@mcp.server.tool()
-async def geocode_address_tool(
-    request: CallToolRequest,
-) -> CallToolResult:
+@mcp_server.tool()
+async def geocode_address(address: str) -> str:
     """Geocode an address to get coordinates"""
     try:
-        args = request.arguments
-        address = args.get("address")
-        
         if not address:
-            return CallToolResult(
-                content=[TextContent(type="text", text="Error: address is required")]
-            )
+            return "Error: address is required"
         
         result = await server.geocode_address(address)
         
         if "error" in result:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Error: {result['error']}")]
-            )
+            return f"Error: {result['error']}"
         
         result_text = f"Address: {result['address']}\n"
+        result_text += f"Formatted Address: {result['formatted_address']}\n"
         result_text += f"Latitude: {result['latitude']}\n"
         result_text += f"Longitude: {result['longitude']}\n"
         
-        return CallToolResult(
-            content=[TextContent(type="text", text=result_text)]
-        )
+        return result_text
     except Exception as e:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Error: {str(e)}")]
-        )
+        return f"Error: {str(e)}"
 
-@mcp.server.tool()
-async def find_nearby_places_tool(
-    request: CallToolRequest,
-) -> CallToolResult:
+@mcp_server.tool()
+async def find_nearby_places(location: str, radius: int = 5000, place_type: str = "") -> str:
     """Find nearby places around a location"""
     try:
-        args = request.arguments
-        location = args.get("location")
-        radius = args.get("radius", 5000)
-        place_type = args.get("place_type")
-        
         if not location:
-            return CallToolResult(
-                content=[TextContent(type="text", text="Error: location is required")]
-            )
+            return "Error: location is required"
         
-        result = await server.find_nearby_places(location, radius, place_type)
+        place_type_param = place_type if place_type else None
+        result = await server.find_nearby_places(location, radius, place_type_param)
         
         if isinstance(result, dict) and "error" in result:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Error: {result['error']}")]
-            )
+            return f"Error: {result['error']}"
         
         result_text = f"Nearby places around {location}:\n\n"
         for place in result:
@@ -546,31 +465,35 @@ async def find_nearby_places_tool(
             result_text += f"Types: {', '.join(place['types'])}\n"
             result_text += "-" * 30 + "\n"
         
-        return CallToolResult(
-            content=[TextContent(type="text", text=result_text)]
-        )
+        return result_text
     except Exception as e:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Error: {str(e)}")]
-        )
+        return f"Error: {str(e)}"
 
-async def main():
+def main():
+    """Main function to start the MCP server"""
+    logger.info("Starting Gmail Calendar Maps MCP Server...")
+    
     # Initialize Google APIs
     credentials_path = "credentials.json"
-    api_key = "YOUR_GOOGLE_MAPS_API_KEY"  # Replace with your actual API key
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY", "YOUR_GOOGLE_MAPS_API_KEY")
     
-    success = await server.initialize_google_apis(credentials_path, api_key)
-    if not success:
-        logger.warning("Failed to initialize Google APIs. Some features may not work.")
+    # Initialize APIs synchronously
+    async def init_apis():
+        return await server.initialize_google_apis(credentials_path, api_key)
+    
+    try:
+        success = asyncio.run(init_apis())
+        if not success:
+            logger.warning("Failed to initialize Google APIs. Some features may not work.")
+        else:
+            logger.info("Google APIs initialized successfully")
+    except Exception as e:
+        logger.warning(f"Failed to initialize Google APIs: {e}. Some features may not work.")
+    
+    logger.info("Starting MCP server with stdio transport...")
     
     # Start the MCP server
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await mcp.server.run_server(
-            read_stream,
-            write_stream,
-            name="gmail-calendar-maps-server",
-            version="1.0.0",
-        )
+    mcp_server.run()
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    main() 
