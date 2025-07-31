@@ -46,9 +46,26 @@ class GmailCalendarMapsServer:
         try:
             # Load credentials
             if Path(credentials_path).exists():
-                self.credentials = Credentials.from_authorized_user_file(
-                    credentials_path, SCOPES
-                )
+                # Check if this is a client secrets file or user credentials file
+                with open(credentials_path, 'r') as f:
+                    cred_data = json.load(f)
+                
+                if 'installed' in cred_data:
+                    # This is a client secrets file, we need to authenticate
+                    logger.info("Found client secrets file, starting OAuth flow...")
+                    flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
+                    self.credentials = flow.run_local_server(port=0)
+                    
+                    # Save the credentials for next time
+                    token_path = "token.json"
+                    with open(token_path, 'w') as token:
+                        token.write(self.credentials.to_json())
+                    logger.info(f"Credentials saved to {token_path}")
+                else:
+                    # This is a user credentials file
+                    self.credentials = Credentials.from_authorized_user_file(
+                        credentials_path, SCOPES
+                    )
                 
                 # Refresh if expired
                 if self.credentials and self.credentials.expired and self.credentials.refresh_token:
